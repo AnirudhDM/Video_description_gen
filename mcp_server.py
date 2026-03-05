@@ -1,7 +1,7 @@
 """
 mcp_server.py
 MCP server for automated coding task video generation.
-No API key needed — Claude Code generates Manim scripts directly.
+No API key needed — Claude Code generates Motion Canvas scenes directly.
 """
 
 import os
@@ -39,6 +39,20 @@ def _get_kokoro_pipeline() -> "KPipeline":
 def run(cmd):
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(BASE_DIR))
     return result.returncode, result.stdout, result.stderr
+
+def run_node(cmd, cwd=None):
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(cwd or BASE_DIR))
+    return result.returncode, result.stdout, result.stderr
+
+PROJECT_TS_TEMPLATE = """\
+import {makeProject} from '@motion-canvas/core';
+import scene from './scenes/SCENE_NAME?scene';
+
+export default makeProject({
+  scenes: [scene],
+  audio: AUDIO_PATH,
+});
+"""
 
 def get_duration(filepath):
     _, out, _ = run([
@@ -138,12 +152,25 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="render_motion_canvas",
+            description="Renders a Motion Canvas TypeScript scene to mp4",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "scene_tsx_path": {"type": "string"},
+                    "audio_path":     {"type": "string"},
+                    "output_path":    {"type": "string"}
+                },
+                "required": ["scene_tsx_path", "audio_path"]
+            }
+        ),
+        Tool(
             name="generate_whiteboard_video",
             description=(
-                "New whiteboard pipeline: single scene, no intro/outro, no subtitles. "
-                "Generates per-step TTS audio, then returns a precise Manim prompt for "
-                "Claude to write a WhiteboardScene with audio baked in via add_sound(). "
-                "One render pass produces the final synced mp4."
+                "Whiteboard pipeline: single scene, no intro/outro, no subtitles. "
+                "Generates per-step TTS audio, concatenates to a full WAV, then returns "
+                "a Motion Canvas TypeScript prompt for Claude to write a .tsx scene. "
+                "Use render_motion_canvas afterwards to render to mp4."
             ),
             inputSchema={
                 "type": "object",
@@ -210,6 +237,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _generate_task_video(**arguments)
     elif name == "generate_whiteboard_video":
         result = await _generate_whiteboard_video(**arguments)
+    elif name == "render_motion_canvas":
+        result = await _render_motion_canvas(**arguments)
     else:
         result = {"error": f"Unknown tool: {name}"}
 
@@ -350,6 +379,57 @@ async def _stitch_video(clips: list, output_path: str) -> dict:
     return {"final_path": output_path, "duration": get_duration(output_path)}
 
 
+async def _render_motion_canvas(scene_tsx_path: str, audio_path: str, output_path: str = None) -> dict:
+    import shutil
+    mc_dir = BASE_DIR / "motion-canvas"
+
+    if not mc_dir.exists():
+        return {"error": f"motion-canvas scaffold not found at {mc_dir}"}
+
+    # Install node_modules on first run
+    if not (mc_dir / "node_modules").exists():
+        rc, out, err = run_node(["npm", "install"], cwd=mc_dir)
+        if rc != 0:
+            return {"error": f"npm install failed: {err}"}
+
+    scene_name = Path(scene_tsx_path).stem
+    final = Path(output_path) if output_path else BASE_DIR / f"{scene_name}.mp4"
+
+    # Write project.ts with correct scene + audio references
+    project_ts = mc_dir / "src" / "project.ts"
+    audio_literal = json.dumps(str(Path(audio_path).expanduser().resolve()))
+    project_ts.write_text(
+        PROJECT_TS_TEMPLATE
+        .replace("SCENE_NAME", scene_name)
+        .replace("AUDIO_PATH", audio_literal)
+    )
+
+    # Copy scene file into motion-canvas/src/scenes/
+    scenes_dir = mc_dir / "src" / "scenes"
+    scenes_dir.mkdir(parents=True, exist_ok=True)
+    source = Path(scene_tsx_path).expanduser().resolve()
+    dest = (scenes_dir / f"{scene_name}.tsx").resolve()
+    if source != dest:
+        shutil.copy2(str(source), str(dest))
+
+    # Render via Puppeteer (drives the Vite dev server headlessly)
+    # argv: scene_name, audio_path (or "" if none), output_mp4_path
+    rc, out, err = run_node(
+        ["node", str(mc_dir / "headless-render.mjs"),
+         scene_name,
+         audio_path,
+         str(final)],
+        cwd=mc_dir
+    )
+    if rc != 0:
+        return {"error": err or out}
+
+    if not final.exists():
+        return {"error": f"Output mp4 not found at {final}. stderr: {err}"}
+
+    return {"video_path": str(final), "duration": get_duration(str(final))}
+
+
 async def _generate_task_video(task_title, task_description, difficulty, topic,
                                 time_estimate, examples, constraints,
                                 output_path=None) -> dict:
@@ -414,14 +494,15 @@ async def _generate_whiteboard_video(
     examples, output_path=None
 ) -> dict:
     """
-    New whiteboard pipeline (single scene, audio baked in):
+    Whiteboard pipeline (single scene, Motion Canvas):
     1. Flatten all example steps into one narration sequence.
-    2. Generate TTS audio for each step.
-    3. Return a precise Manim prompt for Claude to write WhiteboardScene.py.
+    2. Generate TTS audio for each step + concat to full WAV.
+    3. Compute cumulative audio offsets for each step.
+    4. Return a Motion Canvas TypeScript prompt for Claude to write the scene.
     """
     snake      = task_title.lower().replace(" ", "_").replace("-", "_")
-    script_path = BASE_DIR / f"{snake}_whiteboard.py"
-    out        = output_path or str(BASE_DIR / f"{snake}_whiteboard.mp4")
+    scene_path = BASE_DIR / "motion-canvas" / "src" / "scenes" / f"{snake}.tsx"
+    out        = output_path or str(BASE_DIR / f"{snake}.mp4")
     timing_key = snake
 
     # Flatten steps across all examples into a single ordered list
@@ -438,31 +519,36 @@ async def _generate_whiteboard_video(
     if not all_steps:
         return {"error": "examples must contain at least one step"}
 
-    # Generate audio for every step
+    # Generate audio for every step (also produces {timing_key}_full.wav)
     narration_lines = [s["narration"] for s in all_steps]
     audio_result = await _generate_audio(scene_name=timing_key, lines=narration_lines)
     timings = audio_result["timings"]   # [{index, text, file, duration}, ...]
+    full_audio = audio_result["merged_path"]
 
-    # Attach timing data back onto each step
+    # Attach timing + cumulative audio offset onto each step
+    offset = 0.0
     for i, step in enumerate(all_steps):
-        step["wav"]      = timings[i]["file"]
-        step["duration"] = timings[i]["duration"]
+        step["duration"]     = timings[i]["duration"]
+        step["audio_offset"] = round(offset, 3)
+        offset += step["duration"] + 1.5  # 1.5s silent pause per step
 
-    # Build the Manim prompt
+    # Build the Motion Canvas prompt
     prompt_result = _prepare_whiteboard_prompt(
         task_title, short_description, difficulty, time_estimate,
-        examples, all_steps, script_path
+        examples, all_steps, scene_path
     )
 
     return {
-        "status": "audio_ready_script_needed",
-        "script_path": str(script_path),
-        "class_name": "WhiteboardScene",
+        "status": "audio_ready_scene_needed",
+        "scene_path": str(scene_path),
+        "full_audio_path": full_audio,
         "audio_total": audio_result["total_duration"],
         "next_step": prompt_result["prompt"],
         "render_instruction": (
-            f"manim -qm {script_path} WhiteboardScene  "
-            f"# output will be in media/videos/.../WhiteboardScene.mp4"
+            f"Call render_motion_canvas with:\n"
+            f"  scene_tsx_path: \"{scene_path}\"\n"
+            f"  audio_path: \"{full_audio}\"\n"
+            f"  output_path: \"{out}\""
         ),
         "final_path": out,
     }
@@ -484,17 +570,17 @@ def _wrap(text: str, max_chars: int = 32) -> str:
 
 def _prepare_whiteboard_prompt(
     task_title, short_description, difficulty, time_estimate,
-    examples, all_steps, script_path
+    examples, all_steps, scene_path
 ) -> dict:
-    title_wrapped = _wrap(task_title, max_chars=20)
-    desc_wrapped  = _wrap(short_description, max_chars=32)
+    title_safe = title_wrapped = _wrap(task_title, max_chars=20)
+    desc_wrapped = _wrap(short_description, max_chars=36)
 
     steps_spec = "\n".join(
-        f"  Step {s['index'] if 'index' in s else i}:\n"
-        f"    narration:      \"{s['narration']}\"\n"
-        f"    animation_hint: \"{s['animation_hint']}\"\n"
-        f"    wav:            \"{s['wav']}\"\n"
-        f"    duration:       {s['duration']}s"
+        f"  Step {i}:\n"
+        f"    narration:       \"{s['narration']}\"\n"
+        f"    animation_hint:  \"{s['animation_hint']}\"\n"
+        f"    audio_offset:    {s['audio_offset']}s  // cumulative offset into full audio track\n"
+        f"    duration:        {s['duration']}s"
         for i, s in enumerate(all_steps)
     )
 
@@ -503,97 +589,114 @@ def _prepare_whiteboard_prompt(
         for i, ex in enumerate(examples)
     )
 
-    prompt = f"""Write a Manim Python scene and save it to: {script_path}
+    prompt = f"""Write a Motion Canvas TypeScript scene and save it to: {scene_path}
 
-CLASS NAME: WhiteboardScene
+This is a Motion Canvas 2D scene (.tsx). Use @motion-canvas/2d and @motion-canvas/core.
 
-═══ OPENING — BOARD STARTS COMPLETELY EMPTY ══════════════════════════
-The scene must open on a blank dark screen. No left panel, no divider,
-no labels. Build up content gradually so the viewer is never overwhelmed.
+═══ SCENE STRUCTURE ══════════════════════════════════════════════════
+The audio is a single full-track WAV baked into project.ts — do NOT
+import or reference audio files inside the scene. All audio sync is
+done via waitFor() matching cumulative offsets.
 
-Phase 1 — INTRO (full-screen, centered, no split layout yet):
-  Play Step 0 audio while these elements appear one by one:
-    1. Title: Text("{title_wrapped}", font_size=34, color=YELLOW, weight=BOLD)
-              move_to([0, 2.5, 0])
-    2. Function signature chip centered at [0, 1.5, 0]
-              RoundedRectangle(w=5.4, h=0.58) + Text("solution(...) → ...", font_size=20, color=BLUE)
-    3. Description lines, each appearing separately, centered around y=0.4
-    4. "e.g." label + example calls, each fading in one at a time, y=-0.6 downward
+Import pattern:
+  import {{makeScene2D, Layout, Rect, Txt, Line, Circle}} from '@motion-canvas/2d';
+  import {{all, sequence, waitFor, chain, createRef, createSignal, easeInOutCubic}} from '@motion-canvas/core';
 
-Phase 2 — LAYOUT TRANSITION (silent, ~1s):
-  Fade out all intro elements, then fade in:
-    - Vertical divider at x=-1.3
-    - Left panel (see LEFT PANEL spec below)
-  After this transition the split layout is used for the rest of the scene.
+Scene export:
+  export default makeScene2D(function* (view) {{
+    // set background
+    view.fill('#1a1a2e');
+    // scene content...
+  }});
 
-═══ LEFT PANEL (static after transition) ═════════════════════════════
-Build as a single VGroup, arranged DOWN buff=0.42, aligned_edge=LEFT,
-then move_to([-4.1, 0.3, 0]).  Fade in with run_time=0.7.
+═══ LAYOUT & VISUAL DESIGN ════════════════════════════════════════════
+Colors:
+  YELLOW = '#CCFF00'   BG     = '#1a1a2e'   CARD   = '#16213e'
+  BLUE   = '#4FC3F7'   GREEN  = '#69F0AE'   RED    = '#FF5252'
+  ORANGE = '#FFB74D'   MUTED  = '#666688'   WHITE  = '#FFFFFF'
 
-Elements (top to bottom) — NO "CODING TASK" tag, NO difficulty/time pills:
-1. Title
-     Text("{title_wrapped}", font_size=26, color=YELLOW, weight=BOLD, line_spacing=1.25)
+Layout system: Motion Canvas uses flexbox-style props on Layout nodes.
+  <Layout direction="column" gap={{16}} padding={{24}} layout>
 
-2. Description
-     Text("{desc_wrapped}", font_size=16, color=WHITE, line_spacing=1.3)
+Text uses Txt component (NOT Text — this is TypeScript/JSX):
+  <Txt text="{title_safe}" fontSize={{32}} fill="{{'#CCFF00'}}" fontWeight={{700}} />
 
-3. Function signature chip
-     RoundedRectangle(w=4.8, h=0.48, color=BLUE, fill_color="#16213e", fill_opacity=0.95, stroke_width=1.2)
-     Text("solution(...) → ...", font_size=16, color=BLUE) centered on rect
+Cards/boxes use Rect:
+  <Rect width={{320}} height={{48}} radius={{8}} fill="{{'#16213e'}}" stroke="{{'#4FC3F7'}}" lineWidth={{1.5}}>
 
-4. Example calls (small, muted)
-     One Text() per example call, font_size=13, color=MUTED ("#666688")
-     Arranged DOWN buff=0.15, aligned_edge=LEFT
+Subtle grid: add a large Rect with dashed stroke at opacity 0.04 as background decoration.
 
-═══ RIGHT PANEL (walkthrough) ════════════════════════════════════════
-Show the examples being walked through step by step.
+═══ TWO-PHASE LAYOUT ══════════════════════════════════════════════════
+Phase 1 — INTRO (full-screen, centered):
+  While Step 0 audio plays, fade in one by one:
+    1. Title Txt — fontSize 36, fill YELLOW, fontWeight 700, y=-120
+    2. Signature Rect chip — centered at y=-30 (Txt inside: "solution(...) → ...")
+    3. Description Txt lines — centered, fontSize 18, y=60 area
+    4. "e.g." label + example snippets fading in below
 
+Phase 2 — LAYOUT TRANSITION (use waitFor(1) between phases):
+  yield* all(...refs.map(r => r().opacity(0, 0.5)));  // fade out intro
+  // fade in: vertical divider Line at x=-160, left panel, right panel header
+
+═══ LEFT PANEL (static after transition) ══════════════════════════════
+A Layout node anchored left, direction="column", gap=16, x=-520, y=30.
+Elements (top to bottom):
+  1. Title Txt — fontSize 24, fill YELLOW, fontWeight 700
+     text: "{title_wrapped}"
+  2. Description Txt — fontSize 14, fill WHITE
+     text: "{desc_wrapped}"
+  3. Signature chip Rect — fill CARD, stroke BLUE, lineWidth 1.2
+     Txt inside: fontSize 14, fill BLUE
+  4. Example calls Txt — fontSize 12, fill MUTED, one per example
+
+═══ RIGHT PANEL (walkthrough) ══════════════════════════════════════════
 Examples reference:
 {examples_spec}
 
-Suggested Y positions (right panel, adjust if content overflows):
-  Section header : y =  3.2
-  Input row      : y =  2.1   (label + letter boxes)
-  Second row     : y =  1.3
-  Table / chips  : y =  0.4 downward
-  Notes          : y = -2.85
-  Result chip    : y = -3.1
+Use createRef() for every animated element. Build elements for each step,
+starting hidden (opacity 0 or scale 0), then animate them in per step.
 
-═══ SYNC PATTERN — FOLLOW THIS EXACTLY FOR EVERY STEP ═══════════════
-For each step call self.add_sound(wav) BEFORE running any animation.
-Animate + wait so total time equals the audio duration.
-After EVERY step's audio finishes, add a 1.5s silent pause before the next step.
+Suggested y positions (right panel x≈200):
+  Section header : y = -260
+  Input row      : y = -160
+  Working area   : y = -60 to 120
+  Result chip    : y =  220
 
-Template:
-    # Step N — <narration summary>
-    self.wait(0.05)                       # prevent audio cutoff at scene start
-    if os.path.exists("<wav>"):
-        self.add_sound("<wav>")           # ALWAYS before self.play / self.wait
-    self.play(YourAnimation(), run_time=X)
-    self.wait(max(<duration> - X, 0.1))  # fill remaining audio time
-    self.wait(1.5)                        # 1.5s silent pause — EVERY step, no exceptions
+═══ AUDIO SYNC PATTERN — FOLLOW EXACTLY ════════════════════════════════
+The full audio track plays automatically from project.ts.
+Use waitFor(offset) to jump to the correct timestamp before each step's
+animations, so visuals stay locked to narration.
 
-═══ STEPS ════════════════════════════════════════════════════════════
+Template for each step:
+  // Step N — <narration summary>
+  // audio_offset: Xs — animations must START at this point in time
+  // We arrive here at cumulative time = Xs, so no extra waitFor needed
+  // if prior steps consumed exactly their allocated time.
+  // Use: yield* all(animation1, animation2) → takes animDuration seconds
+  // Then: yield* waitFor(stepDuration - animDuration) to fill remaining
+  // Then: yield* waitFor(1.5) for the silent pause between steps
+
+  yield* all(
+    yourRef().opacity(1, 0.5),
+    yourRef().scale(1, 0.4),
+  );
+  yield* waitFor(Math.max(stepDuration - animDuration, 0.1));
+  yield* waitFor(1.5);  // silent pause — EVERY step, no exceptions
+
+═══ STEPS ═════════════════════════════════════════════════════════════
 {steps_spec}
 
-═══ STRICT RULES ════════════════════════════════════════════════════
-- NEVER use Tex() — always Text()
+═══ STRICT RULES ══════════════════════════════════════════════════════
+- File extension is .tsx — use JSX/TSX syntax, NOT Python
+- Use Txt (not Text) — Txt is the Motion Canvas 2D text primitive
+- Use Rect (not RoundedRectangle) with radius={{8}} for cards
 - NO subtitles, captions, or voiced text overlaid on screen
-- NO "CODING TASK" tag and NO difficulty/time pill badges anywhere
-- All right-panel Text() objects: call .set_max_width(6.2)
-- Use RoundedRectangle for all chip/card/box shapes
-- Subtle grid (stroke_width=0.3, color="#ffffff05") added at the very start and kept throughout
-- Colors:
-    YELLOW = "#CCFF00"   BG     = "#1a1a2e"   CARD   = "#16213e"
-    BLUE   = "#4FC3F7"   GREEN  = "#69F0AE"   RED    = "#FF5252"
-    ORANGE = "#FFB74D"   MUTED  = "#666688"   WHITE  = "#FFFFFF"
-- digit_box(char, color, scale=0.72):
-    RoundedRectangle + Text(char) centered, fill_color=CARD, fill_opacity=0.95
-- count_chip(label, value, note, color):
-    RoundedRectangle(w=3.1, h=0.58) + Text(f"{{label}}:  {{value}}  ({{note}})")
-    .set_max_width(2.9) centered
-- import os at the top (needed for os.path.exists wav check)
-- Write ONLY the Python file content, no markdown fences
+- NO "CODING TASK" tag, NO difficulty/time pill badges
+- All animated refs use createRef<NodeType>()
+- Wrap multi-line text in Txt with maxWidth prop
+- Import only from '@motion-canvas/2d' and '@motion-canvas/core'
+- Write ONLY the TypeScript/TSX file content — no markdown fences
+- The scene must export default makeScene2D(...)
 """
     return {"prompt": prompt}
 

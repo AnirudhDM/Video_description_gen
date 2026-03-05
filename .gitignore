@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 audio/
 media/
+motion-canvas/node_modules/
+motion-canvas/dist/
+motion-canvas/output/
