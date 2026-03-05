@@ -33,7 +33,7 @@ server = Server("video-generator")
 def _get_kokoro_pipeline() -> "KPipeline":
     global _kokoro_pipeline
     if _kokoro_pipeline is None:
-        _kokoro_pipeline = KPipeline(lang_code="a")  # "a" = American English
+        _kokoro_pipeline = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
     return _kokoro_pipeline
 
 def run(cmd):
@@ -102,7 +102,8 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "script_path": {"type": "string"},
-                    "scene_name": {"type": "string"}
+                    "scene_name": {"type": "string"},
+                    "output_path": {"type": "string"}
                 },
                 "required": ["script_path", "scene_name"]
             }
@@ -203,7 +204,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     elif name == "prepare_manim_prompt":
         result = await _prepare_manim_prompt(**arguments)
     elif name == "render_scene":
-        result = await _render_scene(arguments["script_path"], arguments["scene_name"])
+        result = await _render_scene(arguments["script_path"], arguments["scene_name"], arguments.get("output_path"))
     elif name == "stitch_video":
         result = await _stitch_video(arguments["clips"], arguments["output_path"])
     elif name == "generate_task_video":
@@ -284,7 +285,7 @@ STRICT RULES:
     }
 
 
-async def _render_scene(script_path: str, scene_name: str) -> dict:
+async def _render_scene(script_path: str, scene_name: str, output_path: str = None) -> dict:
     import shutil
 
     script = Path(script_path)
@@ -302,8 +303,12 @@ async def _render_scene(script_path: str, scene_name: str) -> dict:
     raw_video = sorted(matches)[-1]
     duration  = get_duration(str(raw_video))
 
-    # Copy rendered video to BASE_DIR root before cleanup
-    final_video = BASE_DIR / f"{scene_name}.mp4"
+    # Use caller-supplied output path, or derive from script name to avoid overwriting
+    if output_path:
+        final_video = Path(output_path)
+    else:
+        stem = script.stem.replace("_whiteboard", "")
+        final_video = BASE_DIR / f"{stem}.mp4"
     shutil.copy2(str(raw_video), str(final_video))
 
     # Cleanup: audio, media cache, and the generated scene script

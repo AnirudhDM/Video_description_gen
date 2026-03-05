@@ -1,9 +1,12 @@
 {
   "mcpServers": {
     "video-generator": {
-      "command": "/Users/anirudh.durai.mohan/Documents/side pieces/hack/poc/venv/bin/python3",
+      "command": "uv",
       "args": [
-        "/Users/anirudh.durai.mohan/Documents/side pieces/hack/poc/mcp_server.py"
+        "run",
+        "--project",
+        "/Users/anirudh.durai.mohan/Documents/side pieces/hack/poc",
+        "mcp_server.py"
       ],
       "env": {
         "POC_DIR": "/Users/anirudh.durai.mohan/Documents/side pieces/hack/poc"
