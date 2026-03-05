@@ -6,13 +6,14 @@ No API key needed — Claude Code generates Manim scripts directly.
 
 import os
 import json
-import time
 import glob
 import asyncio
 import subprocess
 from pathlib import Path
 
-import pyttsx3
+import numpy as np
+import soundfile as sf
+from kokoro import KPipeline
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
@@ -20,13 +21,20 @@ from mcp.types import Tool, TextContent
 BASE_DIR   = Path(os.environ.get("POC_DIR", Path.home() / "Desktop/poc")).expanduser()
 AUDIO_DIR  = BASE_DIR / "audio"
 TMP_DIR    = BASE_DIR / "tmp"
-VOICE_NAME = "com.apple.voice.compact.en-US.Samantha"
-VOICE_RATE = 140
+KOKORO_VOICE = "af_nova"
 QUALITY    = "qm"
+
+_kokoro_pipeline: "KPipeline | None" = None
 
 server = Server("video-generator")
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+def _get_kokoro_pipeline() -> "KPipeline":
+    global _kokoro_pipeline
+    if _kokoro_pipeline is None:
+        _kokoro_pipeline = KPipeline(lang_code="a")  # "a" = American English
+    return _kokoro_pipeline
 
 def run(cmd):
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(BASE_DIR))
@@ -41,37 +49,19 @@ def get_duration(filepath):
     ])
     val = out.strip()
     if not val or val == "N/A":
-        return round(os.path.getsize(filepath) / 22050 / 2, 3)
+        return round(os.path.getsize(filepath) / 24000 / 2, 3)
     return round(float(val), 3)
 
 def speak_to_file(text, output_wav):
-    aiff = output_wav.replace(".wav", ".aiff")
-    engine = pyttsx3.init()
-    voices = engine.getProperty("voices")
-    selected = None
-    for v in voices:
-        if VOICE_NAME in v.id:
-            selected = v.id
-            break
-    if not selected:
-        for v in voices:
-            if "en" in v.id.lower():
-                selected = v.id
-                break
-    if selected:
-        engine.setProperty("voice", selected)
-    engine.setProperty("rate", VOICE_RATE)
-    engine.setProperty("volume", 1.0)
-    engine.save_to_file(text, aiff)
-    engine.runAndWait()
-    engine.stop()
-    del engine
-    time.sleep(0.8)
-    if not os.path.exists(aiff) or os.path.getsize(aiff) < 1000:
-        raise Exception(f"aiff empty: {aiff}")
-    run(["ffmpeg", "-y", "-i", aiff, "-ar", "22050", "-ac", "1", output_wav])
-    if os.path.exists(aiff):
-        os.remove(aiff)
+    pipeline = _get_kokoro_pipeline()
+    segments = []
+    for _, _, audio in pipeline(text, voice=KOKORO_VOICE):
+        if audio is not None and len(audio) > 0:
+            segments.append(audio)
+    if not segments:
+        raise Exception(f"Kokoro produced no audio for: {text!r}")
+    combined = np.concatenate(segments, axis=0)
+    sf.write(output_wav, combined, samplerate=24000, subtype="PCM_16")
 
 # ── Tool registry ──────────────────────────────────────────────────────────
 
@@ -80,12 +70,12 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="generate_audio",
-            description="Generates TTS wav files for narration lines using pyttsx3",
+            description="Generates TTS wav files for narration lines using Kokoro",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "scene_name": {"type": "string"},
-                    "lines": {"type": "array", "items": {"type": "string"}}
+                    "lines": {"type": ["array", "string"]}
                 },
                 "required": ["scene_name", "lines"]
             }
@@ -98,9 +88,9 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "task_title": {"type": "string"},
                     "task_description": {"type": "string"},
-                    "examples": {"type": "array"},
-                    "constraints": {"type": "array"},
-                    "narration_lines": {"type": "array"}
+                    "examples": {"type": ["array", "string"]},
+                    "constraints": {"type": ["array", "string"]},
+                    "narration_lines": {"type": ["array", "string"]}
                 },
                 "required": ["task_title", "task_description", "examples", "constraints", "narration_lines"]
             }
@@ -123,7 +113,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "clips": {"type": "array"},
+                    "clips": {"type": ["array", "string"]},
                     "output_path": {"type": "string"}
                 },
                 "required": ["clips", "output_path"]
@@ -140,8 +130,8 @@ async def list_tools() -> list[Tool]:
                     "difficulty": {"type": "string"},
                     "topic": {"type": "string"},
                     "time_estimate": {"type": "string"},
-                    "examples": {"type": "array"},
-                    "constraints": {"type": "array"},
+                    "examples": {"type": ["array", "string"]},
+                    "constraints": {"type": ["array", "string"]},
                     "output_path": {"type": "string"}
                 },
                 "required": ["task_title", "task_description", "difficulty", "topic", "time_estimate", "examples", "constraints"]
@@ -163,14 +153,14 @@ async def list_tools() -> list[Tool]:
                     "difficulty":        {"type": "string"},
                     "time_estimate":     {"type": "string"},
                     "examples": {
-                        "type": "array",
+                        "type": ["array", "string"],
                         "items": {
                             "type": "object",
                             "properties": {
                                 "input":  {"type": "string"},
                                 "output": {"type": "string"},
                                 "steps": {
-                                    "type": "array",
+                                    "type": ["array", "string"],
                                     "items": {
                                         "type": "object",
                                         "properties": {
@@ -191,8 +181,23 @@ async def list_tools() -> list[Tool]:
         ),
     ]
 
+def _parse_args(arguments: dict) -> dict:
+    """JSON-parse any string values that should be lists/dicts (MCP sends arrays as strings)."""
+    out = {}
+    for k, v in arguments.items():
+        if isinstance(v, str):
+            stripped = v.strip()
+            if stripped.startswith(("[", "{")):
+                try:
+                    v = json.loads(stripped)
+                except json.JSONDecodeError:
+                    pass
+        out[k] = v
+    return out
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments = _parse_args(arguments)
     if name == "generate_audio":
         result = await _generate_audio(arguments["scene_name"], arguments["lines"])
     elif name == "prepare_manim_prompt":
@@ -561,10 +566,11 @@ After EVERY step's audio finishes, add a 1.5s silent pause before the next step.
 
 Template:
     # Step N — <narration summary>
+    self.wait(0.05)                       # prevent audio cutoff at scene start
     if os.path.exists("<wav>"):
-        self.add_sound("<wav>")          # ALWAYS before self.play / self.wait
+        self.add_sound("<wav>")           # ALWAYS before self.play / self.wait
     self.play(YourAnimation(), run_time=X)
-    self.wait(max(<duration> - X, 0.05))  # fill remaining audio time
+    self.wait(max(<duration> - X, 0.1))  # fill remaining audio time
     self.wait(1.5)                        # 1.5s silent pause — EVERY step, no exceptions
 
 ═══ STEPS ════════════════════════════════════════════════════════════
