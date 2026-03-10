@@ -54,6 +54,24 @@ export default makeProject({
 });
 """
 
+REMOTION_ROOT_TEMPLATE = """\
+import React from 'react';
+import { Composition } from 'remotion';
+import { SceneComponent } from './compositions/SCENE_NAME';
+
+export const RemotionRoot: React.FC = () => (
+  <Composition
+    id="SCENE_ID"
+    component={SceneComponent}
+    durationInFrames={DURATION_FRAMES}
+    fps={30}
+    width={1280}
+    height={720}
+    defaultProps={{ audioSrc: AUDIO_SRC }}
+  />
+);
+"""
+
 def get_duration(filepath):
     _, out, _ = run([
         "ffprobe", "-v", "error",
@@ -165,6 +183,20 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="render_remotion",
+            description="Renders a Remotion React scene to mp4. Faster than render_motion_canvas — no browser UI automation.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "scene_tsx_path":   {"type": "string"},
+                    "audio_path":       {"type": "string"},
+                    "duration_seconds": {"type": "number"},
+                    "output_path":      {"type": "string"}
+                },
+                "required": ["scene_tsx_path", "audio_path", "duration_seconds"]
+            }
+        ),
+        Tool(
             name="generate_whiteboard_video",
             description=(
                 "Whiteboard pipeline: single scene, no intro/outro, no subtitles. "
@@ -239,6 +271,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _generate_whiteboard_video(**arguments)
     elif name == "render_motion_canvas":
         result = await _render_motion_canvas(**arguments)
+    elif name == "render_remotion":
+        result = await _render_remotion(**arguments)
     else:
         result = {"error": f"Unknown tool: {name}"}
 
@@ -420,6 +454,57 @@ async def _render_motion_canvas(scene_tsx_path: str, audio_path: str, output_pat
          audio_path,
          str(final)],
         cwd=mc_dir
+    )
+    if rc != 0:
+        return {"error": err or out}
+
+    if not final.exists():
+        return {"error": f"Output mp4 not found at {final}. stderr: {err}"}
+
+    return {"video_path": str(final), "duration": get_duration(str(final))}
+
+
+async def _render_remotion(scene_tsx_path: str, audio_path: str, duration_seconds: float,
+                           output_path: str = None) -> dict:
+    import shutil
+    r_dir = BASE_DIR / "remotion"
+
+    if not r_dir.exists():
+        return {"error": f"remotion scaffold not found at {r_dir}"}
+
+    # Install node_modules on first run
+    if not (r_dir / "node_modules").exists():
+        rc, out, err = run_node(["npm", "install"], cwd=r_dir)
+        if rc != 0:
+            return {"error": f"npm install failed: {err}"}
+
+    scene_name = Path(scene_tsx_path).stem
+    final = Path(output_path) if output_path else BASE_DIR / f"{scene_name}.mp4"
+
+    # Copy scene file into remotion/src/compositions/
+    comps_dir = r_dir / "src" / "compositions"
+    comps_dir.mkdir(parents=True, exist_ok=True)
+    source = Path(scene_tsx_path).expanduser().resolve()
+    dest = (comps_dir / f"{scene_name}.tsx").resolve()
+    if source != dest:
+        shutil.copy2(str(source), str(dest))
+
+    # Write Root.tsx with correct scene reference + duration
+    duration_frames = str(int(duration_seconds * 30) + 60)  # +2s buffer
+    audio_literal = json.dumps(str(Path(audio_path).expanduser().resolve()))
+    root_tsx = (r_dir / "src" / "Root.tsx")
+    root_tsx.write_text(
+        REMOTION_ROOT_TEMPLATE
+        .replace("SCENE_NAME", scene_name)
+        .replace("SCENE_ID", scene_name)
+        .replace("DURATION_FRAMES", duration_frames)
+        .replace("AUDIO_SRC", audio_literal)
+    )
+
+    rc, out, err = run_node(
+        ["node", str(r_dir / "render-remotion.mjs"),
+         scene_name, audio_path, str(final)],
+        cwd=r_dir
     )
     if rc != 0:
         return {"error": err or out}

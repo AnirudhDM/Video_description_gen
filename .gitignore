@@ -6,3 +6,5 @@ media/
 motion-canvas/node_modules/
 motion-canvas/dist/
 motion-canvas/output/
+remotion/node_modules/
+remotion/.cache/
