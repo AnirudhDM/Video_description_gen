@@ -190,7 +190,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "scene_tsx_path":   {"type": "string"},
                     "audio_path":       {"type": "string"},
-                    "duration_seconds": {"type": "number"},
+                    "duration_seconds": {"type": ["number", "string"]},
                     "output_path":      {"type": "string"}
                 },
                 "required": ["scene_tsx_path", "audio_path", "duration_seconds"]
@@ -241,7 +241,7 @@ async def list_tools() -> list[Tool]:
     ]
 
 def _parse_args(arguments: dict) -> dict:
-    """JSON-parse any string values that should be lists/dicts (MCP sends arrays as strings)."""
+    """JSON-parse any string values that should be lists/dicts/numbers (MCP sends them as strings)."""
     out = {}
     for k, v in arguments.items():
         if isinstance(v, str):
@@ -250,6 +250,11 @@ def _parse_args(arguments: dict) -> dict:
                 try:
                     v = json.loads(stripped)
                 except json.JSONDecodeError:
+                    pass
+            else:
+                try:
+                    v = int(stripped) if '.' not in stripped else float(stripped)
+                except ValueError:
                     pass
         out[k] = v
     return out
@@ -478,7 +483,8 @@ async def _render_remotion(scene_tsx_path: str, audio_path: str, duration_second
         if rc != 0:
             return {"error": f"npm install failed: {err}"}
 
-    scene_name = Path(scene_tsx_path).stem
+    scene_name = Path(scene_tsx_path).stem          # e.g. garden_tree_equalization
+    comp_id    = scene_name.replace("_", "-")        # Remotion IDs disallow underscores
     final = Path(output_path) if output_path else BASE_DIR / f"{scene_name}.mp4"
 
     # Copy scene file into remotion/src/compositions/
@@ -489,21 +495,26 @@ async def _render_remotion(scene_tsx_path: str, audio_path: str, duration_second
     if source != dest:
         shutil.copy2(str(source), str(dest))
 
+    # Copy audio into remotion/public/ so Remotion's bundle server can serve it
+    public_dir = r_dir / "public"
+    public_dir.mkdir(exist_ok=True)
+    shutil.copy2(str(Path(audio_path).expanduser().resolve()), str(public_dir / "render_audio.wav"))
+    audio_web_path = "/render_audio.wav"  # served from Remotion's bundle server
+
     # Write Root.tsx with correct scene reference + duration
-    duration_frames = str(int(duration_seconds * 30) + 60)  # +2s buffer
-    audio_literal = json.dumps(str(Path(audio_path).expanduser().resolve()))
+    duration_frames = str(int(float(duration_seconds) * 30) + 60)  # +2s buffer
     root_tsx = (r_dir / "src" / "Root.tsx")
     root_tsx.write_text(
         REMOTION_ROOT_TEMPLATE
         .replace("SCENE_NAME", scene_name)
-        .replace("SCENE_ID", scene_name)
+        .replace("SCENE_ID", comp_id)
         .replace("DURATION_FRAMES", duration_frames)
-        .replace("AUDIO_SRC", audio_literal)
+        .replace("AUDIO_SRC", json.dumps(audio_web_path))
     )
 
     rc, out, err = run_node(
         ["node", str(r_dir / "render-remotion.mjs"),
-         scene_name, audio_path, str(final)],
+         comp_id, audio_web_path, str(final)],
         cwd=r_dir
     )
     if rc != 0:

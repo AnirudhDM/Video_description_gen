@@ -11,6 +11,7 @@ import { bundle } from '@remotion/bundler';
 import { renderMedia, selectComposition } from '@remotion/renderer';
 import { fileURLToPath } from 'url';
 import { resolve, dirname } from 'path';
+import { copyFileSync, readdirSync } from 'fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const log = msg => process.stderr.write(`[remotion] ${msg}\n`);
@@ -25,8 +26,18 @@ log('Bundling...');
 const bundleLocation = await bundle({
   entryPoint: resolve(__dirname, 'src/index.ts'),
   onProgress: p => process.stderr.write(`\r  bundle ${Math.round(p * 100)}%  `),
+  publicDir: resolve(__dirname, 'public'),
 });
 process.stderr.write('\n');
+
+// Copy public/ assets into the bundle temp dir so the local server can serve them
+const publicSrc = resolve(__dirname, 'public');
+try {
+  for (const file of readdirSync(publicSrc)) {
+    copyFileSync(resolve(publicSrc, file), resolve(bundleLocation, file));
+    log(`Copied public/${file} → bundle`);
+  }
+} catch {}
 
 log('Selecting composition...');
 const composition = await selectComposition({
