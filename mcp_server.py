@@ -7,6 +7,7 @@ No API key needed — Claude Code generates Motion Canvas scenes directly.
 import os
 import json
 import glob
+import shutil
 import asyncio
 import subprocess
 from pathlib import Path
@@ -197,6 +198,71 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="prepare_notebooklm_doc",
+            description=(
+                "Generates a NotebookLM-optimized source document from raw coding problem markdown. "
+                "Covers ONLY: problem description, examples walkthrough, constraints — no solution hints. "
+                "Returns a prompt for Claude to write the document AND a notebooklm_prompt to paste "
+                "into NotebookLM's customization dialog when clicking 'Generate Video Overview'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_markdown": {"type": "string", "description": "Raw markdown of the coding problem"},
+                    "tone": {
+                        "type": "string",
+                        "enum": ["interview", "explainer", "neutral"],
+                        "description": "interview=professional/direct, explainer=narrative/podcast, neutral=balanced"
+                    },
+                    "target_duration": {
+                        "type": "string",
+                        "enum": ["1min", "2min", "3min"],
+                        "description": "Target video length. 1min=~250 words tight, 2min=~500 words, 3min=~750 words"
+                    }
+                },
+                "required": ["task_markdown"]
+            }
+        ),
+        Tool(
+            name="setup_notebooklm",
+            description=(
+                "One-time setup: opens a headed browser so the user can log in to Google, "
+                "then saves the session and notebook URL for future headless use."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "notebook_url": {
+                        "type": "string",
+                        "description": "URL of the NotebookLM notebook to use permanently"
+                    }
+                },
+                "required": ["notebook_url"]
+            }
+        ),
+        Tool(
+            name="upload_to_notebooklm",
+            description=(
+                "Uploads a document to NotebookLM via Playwright, selects it as the only source, "
+                "pastes the customization prompt, and kicks off audio generation. "
+                "Returns once generation has started. Run setup_notebooklm first."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "document_text": {
+                        "type": "string",
+                        "description": "The generated NotebookLM source document text"
+                    },
+                    "notebooklm_prompt": {
+                        "type": "string",
+                        "description": "The customization prompt to paste into the generation dialog"
+                    }
+                },
+                "required": ["document_text", "notebooklm_prompt"]
+            }
+        ),
+        Tool(
             name="generate_whiteboard_video",
             description=(
                 "Whiteboard pipeline: single scene, no intro/outro, no subtitles. "
@@ -278,6 +344,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _render_motion_canvas(**arguments)
     elif name == "render_remotion":
         result = await _render_remotion(**arguments)
+    elif name == "prepare_notebooklm_doc":
+        result = await _prepare_notebooklm_doc(**arguments)
+    elif name == "setup_notebooklm":
+        result = await _setup_notebooklm(**arguments)
+    elif name == "upload_to_notebooklm":
+        result = await _upload_to_notebooklm(**arguments)
     else:
         result = {"error": f"Unknown tool: {name}"}
 
@@ -795,6 +867,189 @@ Template for each step:
 - The scene must export default makeScene2D(...)
 """
     return {"prompt": prompt}
+
+
+async def _prepare_notebooklm_doc(
+    task_markdown: str,
+    tone: str = "neutral",
+    target_duration: str = "2min",
+) -> dict:
+    tone_styles = {
+        "interview": (
+            "Professional and direct. Address the reader in second person "
+            "('You are given...', 'Your task is to...', 'Consider what happens when...'). "
+            "Tone is like a technical interviewer reading the problem aloud: precise, no fluff."
+        ),
+        "explainer": (
+            "Warm and narrative. Use first-person plural "
+            "('Let's explore...', 'Imagine we have...', 'What would happen if...'). "
+            "Tone is like a curious podcast host discovering the problem with the listener."
+        ),
+        "neutral": (
+            "Clear and balanced. Neither interview-formal nor overly casual. "
+            "State facts, walk through examples methodically, let the problem speak for itself."
+        ),
+    }
+    style = tone_styles.get(tone, tone_styles["neutral"])
+
+    duration_configs = {
+        "1min": {
+            "word_target": 250,
+            "problem_budget": "2 sentences",
+            "example_budget": "1 short paragraph per example",
+            "constraint_budget": "bullets only — one line each",
+            "include_before_you_begin": False,
+        },
+        "2min": {
+            "word_target": 500,
+            "problem_budget": "1 paragraph",
+            "example_budget": "1 paragraph per example",
+            "constraint_budget": "1 sentence each",
+            "include_before_you_begin": False,
+        },
+        "3min": {
+            "word_target": 750,
+            "problem_budget": "2 paragraphs",
+            "example_budget": "2 paragraphs per example",
+            "constraint_budget": "1 sentence each",
+            "include_before_you_begin": True,
+        },
+    }
+    cfg = duration_configs.get(target_duration, duration_configs["2min"])
+
+    before_you_begin_section = ""
+    if cfg["include_before_you_begin"]:
+        before_you_begin_section = """
+### Before You Begin
+[1 sentence in the chosen tone that frames this as a challenge. No hints. No extended closing.]
+"""
+
+    # These prompts are typed into the NotebookLM Chat to trigger Video Overview generation.
+    # The word "Video Overview" in the prompt is what causes NotebookLM to auto-start generation.
+    notebooklm_prompts = {
+        "1min": (
+            "Generate a Video Overview for this problem. Keep it strictly under 1 minute. "
+            "Cover only: one sentence on what the problem asks, then walk through example 1 only — "
+            "state the input, state the output, confirm it matches the definition. "
+            "End there. No solution hints, no algorithm discussion, no sign-off."
+        ),
+        "2min": (
+            "Generate a Video Overview for this problem. Keep it strictly under 2 minutes. "
+            "Cover only: a brief introduction to what the problem asks (2-3 sentences), "
+            "then walk through each example — state the input, state the output, explain why "
+            "it's correct per the problem definition only (not any algorithm). "
+            "Do not mention any solution approach. Stop after the examples."
+        ),
+        "3min": (
+            "Generate a Video Overview for this problem. Keep it under 3 minutes. "
+            "Cover: what the problem asks, all examples with input/output walkthroughs, "
+            "and the constraints as plain facts. "
+            "No solution hints, no algorithm discussion. End after constraints."
+        ),
+    }
+    notebooklm_prompt = notebooklm_prompts.get(target_duration, notebooklm_prompts["2min"])
+
+    prompt = f"""Generate a NotebookLM source document for the coding problem below.
+This document will be uploaded to NotebookLM to generate a ~{target_duration} Video Overview.
+
+TONE: {style}
+
+STRICT CONSTRAINTS:
+- Target ~{cfg["word_target"]} words total
+- Cover ONLY: problem description, examples walkthrough, constraints
+- DO NOT include: solution approaches, algorithm hints, time/space complexity, patterns to use
+- The document ends BEFORE any solution discussion
+- Problem statement: {cfg["problem_budget"]}
+- Each example: {cfg["example_budget"]}
+- Each constraint: {cfg["constraint_budget"]}
+
+SOURCE MARKDOWN:
+---
+{task_markdown}
+---
+
+Write the document with exactly these sections:
+
+## [Problem Title]: Understanding the Challenge
+
+### What You're Being Asked
+[{cfg["problem_budget"]} in the chosen tone. What does the problem ask for? What is the input?
+What is the output? What makes a valid answer? Be concrete — no solution hints.]
+
+### Walking Through the Examples
+[For EACH example in the markdown: {cfg["example_budget"]} tracing the input,
+stating the expected output, and explaining WHY that output is correct per the problem
+definition — NOT in terms of any algorithm.]
+
+### The Rules of the Game
+[For each constraint: {cfg["constraint_budget"]} about what it means in practice.
+Do NOT say what algorithm that suggests.]{before_you_begin_section}
+Write the full document now. No markdown fences. Clean prose only."""
+
+    return {
+        "status": "prompt_ready",
+        "tone": tone,
+        "target_duration": target_duration,
+        "prompt": prompt,
+        "notebooklm_prompt": notebooklm_prompt,
+        "instructions": (
+            "Execute the prompt above to generate the NotebookLM document. "
+            "Then call upload_to_notebooklm(document_text=..., notebooklm_prompt=...) — "
+            "Playwright will add the document as a source and type the notebooklm_prompt "
+            "into the Chat, which triggers Video Overview generation automatically."
+        ),
+    }
+
+
+async def _setup_notebooklm(notebook_url: str) -> dict:
+    session_dir = str(BASE_DIR / "notebooklm_session")
+    config_path = BASE_DIR / "notebooklm_config.json"
+    script = str(BASE_DIR / "notebooklm_playwright.py")
+
+    rc, out, err = run([
+        "python", script,
+        "--setup",
+        "--notebook-url", notebook_url,
+        "--session-dir", session_dir,
+    ])
+    if rc != 0:
+        return {"status": "error", "message": err or out}
+
+    config_path.write_text(json.dumps({"notebook_url": notebook_url}))
+    return {
+        "status": "session_saved",
+        "notebook_url": notebook_url,
+        "session_dir": session_dir,
+    }
+
+
+async def _upload_to_notebooklm(document_text: str, notebooklm_prompt: str) -> dict:
+    config_path = BASE_DIR / "notebooklm_config.json"
+    if not config_path.exists():
+        return {
+            "status": "error",
+            "message": "Run setup_notebooklm first to configure notebook URL and session.",
+        }
+
+    config = json.loads(config_path.read_text())
+    notebook_url = config["notebook_url"]
+    session_dir = str(BASE_DIR / "notebooklm_session")
+    script = str(BASE_DIR / "notebooklm_playwright.py")
+
+    rc, out, err = run([
+        "python", script,
+        "--notebook-url", notebook_url,
+        "--session-dir", session_dir,
+        "--document-text", document_text,
+        "--notebooklm-prompt", notebooklm_prompt,
+    ])
+    if rc != 0:
+        return {"status": "error", "message": err or out}
+
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return {"status": "error", "message": f"Unexpected output: {out}", "stderr": err}
 
 
 # ── Run ────────────────────────────────────────────────────────────────────
