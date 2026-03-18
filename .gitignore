@@ -1,8 +1,22 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
+*.mp4
+*.wav
+.DS_Store
+
+# NotebookLM secrets & session
+.env
+notebooklm_session/
+notebooklm_config.json
+
+# Generated assets
 audio/
 media/
+tmp/
+
+# Node
 motion-canvas/node_modules/
 motion-canvas/dist/
 motion-canvas/output/

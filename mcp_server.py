@@ -19,7 +19,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-BASE_DIR   = Path(os.environ.get("POC_DIR", Path.home() / "Desktop/poc")).expanduser()
+BASE_DIR   = Path(__file__).parent
 AUDIO_DIR  = BASE_DIR / "audio"
 TMP_DIR    = BASE_DIR / "tmp"
 KOKORO_VOICE = "af_nova"
