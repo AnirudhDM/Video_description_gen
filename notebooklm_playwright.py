@@ -21,15 +21,20 @@ CONFIRMED SELECTORS (verified March 2026, NotebookLM PRO):
   Paste textarea    : textarea[placeholder="Paste text here"]
   Insert button     : button:has-text("Insert")
   Source item       : div.single-source-container
+  Source menu btn   : div.single-source-container button[aria-label="Source options"]
+  Remove source     : button:has-text("Remove source")
+  Video card menu   : button[aria-label="Video overview options"]
+  Delete video      : button:has-text("Delete")
   Chat textarea     : textarea[placeholder="Start typing..."]
   Chat submit       : button[aria-label="Submit"]:not([disabled])
   Generation start  : text "Generating Video Overview" in Studio panel
 
 WORKFLOW:
-  1. Add source via "Add sources" → "Copied text" → paste → Insert
-  2. Type the notebooklm_prompt into the Chat textarea and submit
-  3. NotebookLM automatically starts Video Overview generation
-  4. Script exits; generation continues in NotebookLM's cloud
+  1. Clear existing sources (Remove source) and videos (Delete) from previous run
+  2. Add source via "Add sources" -> "Copied text" -> paste -> Insert
+  3. Type the notebooklm_prompt into the Chat textarea and submit
+  4. NotebookLM automatically starts Video Overview generation
+  5. Script exits; generation continues in NotebookLM's cloud
 
 NOTE: Uses channel="chrome" (real system Chrome) to avoid Google's
 headless detection which would sign out the Playwright session.
@@ -45,6 +50,8 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--setup", action="store_true",
                    help="Open headed browser for Google login, save session, then exit.")
+    p.add_argument("--clear-only", action="store_true",
+                   help="Open headed browser, clear all sources and videos, then exit.")
     p.add_argument("--notebook-url", required=True)
     p.add_argument("--session-dir", required=True)
     p.add_argument("--document-text", default="")
@@ -84,6 +91,67 @@ def run_setup(args):
     print(json.dumps({"status": "session_saved"}))
 
 
+# ── Clear mode ────────────────────────────────────────────────────────────────
+
+def clear_notebook(page):
+    """
+    Removes all existing sources and deletes all existing video overviews
+    from the notebook before a new upload.
+
+    Sources: hover source row to reveal three-dot menu -> Remove source
+    Videos:  click the three-dot menu on each video card -> Delete
+    """
+
+    # ── Remove all sources ────────────────────────────────────────────────────
+    while True:
+        sources = page.locator('div.single-source-container')
+        if sources.count() == 0:
+            break
+        try:
+            source = sources.first
+            source.hover()
+            page.wait_for_timeout(500)
+            # The menu button appears on hover — find any icon button within the row
+            menu_btn = source.locator('button').last
+            menu_btn.click()
+            page.wait_for_selector('button:has-text("Remove source")', timeout=5000)
+            page.click('button:has-text("Remove source")')
+            # Confirm the "Delete Pasted Text?" dialog
+            page.wait_for_selector('[role="dialog"] button:has-text("Delete")', timeout=5000)
+            page.click('[role="dialog"] button:has-text("Delete")')
+            page.wait_for_timeout(2000)
+        except PlaywrightTimeoutError:
+            break
+
+    # ── Delete all video overviews ────────────────────────────────────────────
+    # Anchor off the play button -- each video card in Studio has a play button
+    # and a three-dot (More options) button as siblings inside the same card.
+    while True:
+        # Find any play button visible in the Studio panel
+        play_btn = page.locator(
+            'button[aria-label="Play"], '
+            'button[aria-label="Play video overview"], '
+            'button[aria-label*="play" i]'
+        ).first
+        if play_btn.count() == 0:
+            break
+        try:
+            # Walk up to the card container and find the three-dot (last button)
+            card = play_btn.locator('xpath=../..')
+            card.hover()
+            page.wait_for_timeout(500)
+            menu_btn = card.locator('button').last
+            menu_btn.click()
+            page.wait_for_selector('button:has-text("Delete")', timeout=5000)
+            page.locator('button:has-text("Delete")').last.click()
+            # Confirm the deletion dialog
+            page.wait_for_selector('[role="dialog"] button:has-text("Delete")', timeout=5000)
+            page.click('[role="dialog"] button:has-text("Delete")')
+            page.wait_for_timeout(2000)
+        except PlaywrightTimeoutError:
+            break
+
+
 # ── Upload mode ───────────────────────────────────────────────────────────────
 
 def run_upload(args):
@@ -101,6 +169,9 @@ def run_upload(args):
         # Dismiss any leftover overlay from a previous session
         page.keyboard.press("Escape")
         page.wait_for_timeout(500)
+
+        # ── 0. Clear previous sources and videos ──────────────────────────
+        clear_notebook(page)
 
         # ── 1. Add source ─────────────────────────────────────────────────
         page.wait_for_selector('button[aria-label="Add source"]', timeout=15_000)
@@ -120,7 +191,7 @@ def run_upload(args):
         except PlaywrightTimeoutError:
             raise RuntimeError("Source did not appear after insert")
 
-        # ── 3. Type chat prompt → triggers Video Overview generation ──────
+        # ── 3. Type chat prompt -> triggers Video Overview generation ──────
         # Typing a prompt that mentions "Video Overview" in the Chat area
         # causes NotebookLM to automatically start generating a Video Overview.
         chat = 'textarea[placeholder="Start typing..."]'
@@ -150,11 +221,37 @@ def run_upload(args):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def run_clear_only(args):
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            args.session_dir,
+            headless=False,
+            channel="chrome",
+        )
+        page = ctx.new_page()
+        page.goto(args.notebook_url)
+        page.wait_for_load_state("domcontentloaded", timeout=30_000)
+        page.wait_for_timeout(6000)
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(500)
+
+        print("Clearing notebook...", file=sys.stderr)
+        clear_notebook(page)
+        print("Done. Browser stays open for inspection. Close it to exit.", file=sys.stderr)
+
+        input("\n[notebooklm] Press Enter to close the browser: ")
+        ctx.close()
+
+    print(json.dumps({"status": "cleared"}))
+
+
 def main():
     args = parse_args()
     try:
         if args.setup:
             run_setup(args)
+        elif args.clear_only:
+            run_clear_only(args)
         else:
             if not args.document_text:
                 print(json.dumps({"status": "error", "message": "--document-text is required"}))
