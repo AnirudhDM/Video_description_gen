@@ -340,8 +340,7 @@ async def _upload_to_notebooklm(document_text: str, notebooklm_prompt: str) -> d
     if setup["status"] != "ready":
         return setup
 
-    config = json.loads(config_path.read_text())
-    notebook_url = config["notebook_url"]
+    notebook_url = setup["notebook_url"]
     session_dir = str(BASE_DIR / "notebooklm_session")
     script = str(BASE_DIR / "notebooklm_playwright.py")
 
