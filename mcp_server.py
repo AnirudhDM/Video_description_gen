@@ -36,6 +36,16 @@ def run(cmd):
 async def list_tools() -> list[Tool]:
     return [
         Tool(
+            name="check_setup",
+            description=(
+                "CALL THIS FIRST before using any other tool. "
+                "Checks whether the NotebookLM automation is ready to use. "
+                "On first run it returns step-by-step setup instructions. "
+                "On subsequent runs it returns status=ready and you can proceed directly to video generation."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        Tool(
             name="prepare_notebooklm_doc",
             description=(
                 "Generates a NotebookLM-optimized source document from raw coding problem markdown. "
@@ -122,7 +132,9 @@ def _parse_args(arguments: dict) -> dict:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     arguments = _parse_args(arguments)
-    if name == "prepare_notebooklm_doc":
+    if name == "check_setup":
+        result = await _check_setup()
+    elif name == "prepare_notebooklm_doc":
         result = await _prepare_notebooklm_doc(**arguments)
     elif name == "setup_notebooklm":
         result = await _setup_notebooklm(**arguments)
@@ -135,6 +147,43 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 # ── Tool implementations ─────────────────────────────────────────────────────
+
+async def _check_setup() -> dict:
+    config_path = BASE_DIR / "notebooklm_config.json"
+    session_dir = BASE_DIR / "notebooklm_session"
+    has_config = config_path.exists()
+    has_session = session_dir.exists() and any(session_dir.iterdir())
+
+    if has_config and has_session:
+        config = json.loads(config_path.read_text())
+        return {
+            "status": "ready",
+            "notebook_url": config.get("notebook_url"),
+            "message": "Setup complete. You can call prepare_notebooklm_doc then upload_to_notebooklm.",
+        }
+
+    steps = []
+    if not has_session or not has_config:
+        steps.append(
+            "1. Ask the user for their NotebookLM notebook URL "
+            "(format: https://notebooklm.google.com/notebook/<id>)."
+        )
+        steps.append(
+            "2. Call setup_notebooklm(notebook_url=<url>). "
+            "This opens a Chrome window — tell the user to log in to Google "
+            "and press Enter in the terminal when done."
+        )
+        steps.append(
+            "3. Call check_setup again to confirm status=ready, "
+            "then proceed with video generation."
+        )
+
+    return {
+        "status": "first_run",
+        "message": "NotebookLM is not configured yet. Follow the steps below.",
+        "steps": steps,
+    }
+
 
 async def _prepare_notebooklm_doc(
     task_markdown: str,
@@ -287,12 +336,9 @@ async def _setup_notebooklm(notebook_url: str) -> dict:
 
 
 async def _upload_to_notebooklm(document_text: str, notebooklm_prompt: str) -> dict:
-    config_path = BASE_DIR / "notebooklm_config.json"
-    if not config_path.exists():
-        return {
-            "status": "error",
-            "message": "Run setup_notebooklm first to configure notebook URL and session.",
-        }
+    setup = await _check_setup()
+    if setup["status"] != "ready":
+        return setup
 
     config = json.loads(config_path.read_text())
     notebook_url = config["notebook_url"]
