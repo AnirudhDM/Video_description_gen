@@ -10,15 +10,21 @@ Tools:
 
 import os
 import json
+import shutil
 import subprocess
 import asyncio
 from pathlib import Path
+from datetime import datetime, timezone
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 BASE_DIR = Path(__file__).parent
+
+# SESSION_TTL_SECONDS defaults to 1 hour. Set to a lower value in .env for testing.
+# e.g. SESSION_TTL_SECONDS=30 to expire in 30 seconds.
+SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", 3600))
 
 server = Server("video-generator")
 
@@ -156,27 +162,39 @@ async def _check_setup() -> dict:
 
     if has_config and has_session:
         config = json.loads(config_path.read_text())
+
+        # Check session TTL
+        created_at = config.get("session_created_at")
+        if created_at:
+            age_seconds = (datetime.now(timezone.utc) - datetime.fromisoformat(created_at)).total_seconds()
+            if age_seconds > SESSION_TTL_SECONDS:
+                # Wipe session files — they are now obsolete
+                shutil.rmtree(session_dir, ignore_errors=True)
+                config_path.unlink(missing_ok=True)
+                return {
+                    "status": "session_expired",
+                    "message": (
+                        f"Session expired after {int(age_seconds / 60)} minutes. "
+                        "All session files have been deleted. "
+                        "Call setup_notebooklm(notebook_url=...) to log in again."
+                    ),
+                }
+
         return {
             "status": "ready",
             "notebook_url": config.get("notebook_url"),
             "message": "Setup complete. You can call prepare_notebooklm_doc then upload_to_notebooklm.",
         }
 
-    steps = []
-    if not has_session or not has_config:
-        steps.append(
-            "1. Ask the user for their NotebookLM notebook URL "
-            "(format: https://notebooklm.google.com/notebook/<id>)."
-        )
-        steps.append(
-            "2. Call setup_notebooklm(notebook_url=<url>). "
-            "This opens a Chrome window — tell the user to log in to Google "
-            "and press Enter in the terminal when done."
-        )
-        steps.append(
-            "3. Call check_setup again to confirm status=ready, "
-            "then proceed with video generation."
-        )
+    steps = [
+        "1. Ask the user for their NotebookLM notebook URL "
+        "(format: https://notebooklm.google.com/notebook/<id>).",
+        "2. Call setup_notebooklm(notebook_url=<url>). "
+        "This opens a Chrome window — tell the user to log in to Google "
+        "and press Enter in the terminal when done.",
+        "3. Call check_setup again to confirm status=ready, "
+        "then proceed with video generation.",
+    ]
 
     return {
         "status": "first_run",
@@ -327,11 +345,15 @@ async def _setup_notebooklm(notebook_url: str) -> dict:
     if rc != 0:
         return {"status": "error", "message": err or out}
 
-    config_path.write_text(json.dumps({"notebook_url": notebook_url}))
+    config_path.write_text(json.dumps({
+        "notebook_url": notebook_url,
+        "session_created_at": datetime.now(timezone.utc).isoformat(),
+    }))
     return {
         "status": "session_saved",
         "notebook_url": notebook_url,
         "session_dir": session_dir,
+        "expires_in_minutes": SESSION_TTL_SECONDS // 60,
     }
 
 
