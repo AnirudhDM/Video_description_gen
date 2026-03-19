@@ -25,11 +25,15 @@ python notebooklm_playwright.py \
   --notebook-url "$NOTEBOOKLM_URL" \
   --session-dir "$(pwd)/notebooklm_session"
 
-# Write notebooklm_config.json so the MCP tool knows the URL
+# Write notebooklm_config.json with URL and session timestamp
 python -c "
 import json
 from pathlib import Path
-Path('notebooklm_config.json').write_text(json.dumps({'notebook_url': '$NOTEBOOKLM_URL'}))
+from datetime import datetime, timezone
+Path('notebooklm_config.json').write_text(json.dumps({
+    'notebook_url': '$NOTEBOOKLM_URL',
+    'session_created_at': datetime.now(timezone.utc).isoformat(),
+}))
 print('Config saved.')
 "
 
