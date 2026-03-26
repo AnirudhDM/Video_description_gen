@@ -248,28 +248,47 @@ async def _prepare_notebooklm_doc(
     }
     cfg = duration_configs.get(target_duration, duration_configs["2min"])
 
+    # Shared strict rules injected into every prompt tier
+    _slide_rules = (
+        "STRICT SLIDE RULES — follow these exactly: "
+        "1. Every single slide MUST contain readable text with substantive information. "
+        "2. NO decorative slides, NO graphical-only slides, NO transition slides, NO empty title cards. "
+        "3. If a slide would only show a title or an image with no informative text, DELETE it. "
+        "4. Viewers must have enough time to read every word on each slide — keep text concise but present. "
+        "5. Never repeat the same information across two slides. "
+        "6. No solution hints, no algorithm discussion, no complexity analysis. "
+    )
+
     notebooklm_prompts = {
         "1min": (
-            "Generate a Video Overview for this problem. Keep it strictly under 1 minute. "
-            "Cover only: one sentence on what the problem asks, then walk through example 1 only — "
-            "state the input, state the output, confirm it matches the definition. "
-            "End with 1 sentence reminding the candidate to implement the solution function in the "
-            "provided file. No solution hints, no algorithm discussion."
+            "Generate a Video Overview for this problem. Strictly under 1 minute. "
+            f"{_slide_rules} "
+            "Use EXACTLY 3 slides, no more, no less: "
+            "Slide 1 — Problem: what the task asks + what 'balanced' means (with 1 valid and 1 invalid example). "
+            "Slide 2 — Example: show S = input, trace balanced substrings, state the answer. "
+            "Slide 3 — Task: function signature, constraints, correctness reminder. "
+            "Each slide stays on screen ~15-20 seconds. That's it — three dense, readable slides."
         ),
         "2min": (
-            "Generate a Video Overview for this problem. Keep it strictly under 2 minutes. "
-            "Cover only: a brief introduction to what the problem asks (2-3 sentences), "
-            "then walk through each example — state the input, state the output, explain why "
-            "it's correct per the problem definition only (not any algorithm). "
-            "End with 1-2 sentences directed at the candidate: remind them to implement the "
-            "solution function in the provided file and focus on correctness across all constraint "
-            "ranges. Do not explain any solution approach."
+            "Generate a Video Overview for this problem. Strictly under 2 minutes. "
+            f"{_slide_rules} "
+            "Use EXACTLY 4 slides, no more, no less: "
+            "Slide 1 — Problem: one-sentence summary of what the task asks. "
+            "Slide 2 — Definition: what 'balanced' means, 2-3 tiny valid examples, 1 counter-example. "
+            "Slide 3 — Example: show the main input, trace through it, highlight the longest balanced substrings, state the answer. "
+            "Slide 4 — Task: function signature, constraints, correctness reminder. "
+            "Each slide stays on screen ~25-30 seconds. Four dense, readable slides — nothing else."
         ),
         "3min": (
-            "Generate a Video Overview for this problem. Keep it under 3 minutes. "
-            "Cover: what the problem asks, all examples with input/output walkthroughs, "
-            "the constraints as plain facts, and a closing reminder to implement the solution "
-            "function in the provided file. No solution hints, no algorithm discussion."
+            "Generate a Video Overview for this problem. Strictly under 3 minutes. "
+            f"{_slide_rules} "
+            "Use EXACTLY 5 slides, no more, no less: "
+            "Slide 1 — Problem: one-sentence summary of what the task asks. "
+            "Slide 2 — Definition: what the key concept means, with valid examples and a counter-example. "
+            "Slide 3 — Example 1: show input, trace through, state output and why. "
+            "Slide 4 — Example 2 (if available, otherwise deeper trace of Example 1): show input, trace, state output. "
+            "Slide 5 — Task: function signature, all constraints, correctness reminder. "
+            "Each slide stays on screen ~30-35 seconds. Five dense, readable slides — nothing else."
         ),
     }
     notebooklm_prompt = notebooklm_prompts.get(target_duration, notebooklm_prompts["2min"])
@@ -281,38 +300,38 @@ TONE: {style}
 
 STRICT CONSTRAINTS:
 - Target ~{cfg["word_target"]} words total
-- Cover ONLY: problem description, examples walkthrough, constraints, implementation callout
+- Cover ONLY: problem + definition, example walkthrough, function signature + constraints
 - DO NOT include: solution approaches, algorithm hints, time/space complexity, patterns to use
-- Problem statement: {cfg["problem_budget"]}
+- Problem statement + definition: {cfg["problem_budget"]} + 2-3 sentences defining the key concept
 - Each example: {cfg["example_budget"]}
 - Each constraint: {cfg["constraint_budget"]}
+
+SLIDE ECONOMY — CRITICAL:
+- This document drives a video. Each section = one video slide.
+- Every section must be dense with information. No padding, no filler.
+- Every sentence must teach the viewer something new.
+- Do NOT write anything that would produce a decorative or graphical-only slide.
+- Do NOT create sections that merely restate a title or contain only a heading.
 
 SOURCE MARKDOWN:
 ---
 {task_markdown}
 ---
 
-Write the document with exactly these sections:
+Write the document with EXACTLY these sections (each section = one video slide):
 
-## [Problem Title]: Understanding the Challenge
+## [Problem Title]: What It Asks
+[{cfg["problem_budget"]} stating what the problem asks: input, output, what makes an answer valid.
+Then define the key concept (e.g., what "balanced" means). Include 2-3 tiny valid examples
+and 1 counter-example inline. All in one dense block — no sub-headings.]
 
-### What You're Being Asked
-[{cfg["problem_budget"]} in the chosen tone. What does the problem ask for? What is the input?
-What is the output? What makes a valid answer? Be concrete — no solution hints.]
+## Example
+[For the primary example: {cfg["example_budget"]} — show the input string, trace which substrings
+are balanced and why, identify the longest one(s), state the answer. Keep it concrete.]
 
-### Walking Through the Examples
-[For EACH example in the markdown: {cfg["example_budget"]} tracing the input,
-stating the expected output, and explaining WHY that output is correct per the problem
-definition — NOT in terms of any algorithm.]
-
-### The Rules of the Game
-[For each constraint: {cfg["constraint_budget"]} about what it means in practice.
-Do NOT say what algorithm that suggests.]
-
-### Your Task
-[1-2 sentences in the chosen tone: name the exact function signature the candidate must implement,
-tell them to write it in the provided solution file, and remind them to handle all constraint
-ranges correctly. No hints about how to solve it.]
+## Implement: solution(S)
+[State the function signature. State constraints inline ({cfg["constraint_budget"]}).
+Remind to focus on correctness. 2-3 sentences max. No hints about approach.]
 
 Write the full document now. No markdown fences. Clean prose only."""
 
